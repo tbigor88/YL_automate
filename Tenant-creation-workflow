@@ -1,0 +1,1097 @@
+AI Data Center Tenant Configuration Automation
+Workflow Orchestration: orchestrate-tenants.sh
+Shell command shown in the source: cat orchestrate-tenants.sh.
+#!/bin/bash
+# orchestrate-tenants.sh
+
+echo "▶️ Step 1: Create dynamic YAML..."
+python3 create_dynamic_yaml-with-gpu-server.py || exit 1
+
+echo "▶️ Step 2: Generate configs..."
+python3 generate_dynamic_tenants.py || exit 1
+
+echo "▶️ Step 3: Deploy per-leaf configs..."
+# Parse unique leaf names from generated tenant YAML
+for leaf in $(grep -o 'STRIPE[0-9]_LEAF[0-9]' tenants_dynamic.yaml | sort -u); do
+    ./deploy-tenants.sh "$leaf"
+done 
+Tenant Definition: create_dynamic_yaml-with-gpu-server.py
+Python Script
+#!/usr/bin/env python3
+import yaml
+import os
+import ipaddress
+import re
+from tabulate import tabulate
+from collections import defaultdict
+
+FABRIC_MAP_FILE = "fabric-map.txt"
+RESOURCES_FILE = "resources.txt"
+YAML_OUT = "tenants_dynamic.yaml"
+
+
+def load_fabric_map():
+    server_gpu = defaultdict(lambda: defaultdict(list))  # server -> gpu -> [(leaf, iface, desc)]
+    server_gpus = defaultdict(set)                       # server -> {gpu indices}
+    leaf_router_id = {}                                  # leaf -> router-id
+
+    with open(FABRIC_MAP_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+
+            leaf, router_id, iface, server, server_iface = parts[:5]
+            leaf_router_id[leaf] = router_id
+
+            gnum = None
+            s_if = server_iface.lower()
+            if s_if.startswith("gpu") and "_eth" in s_if:
+                try:
+                    gnum = int(s_if.split("_eth")[0].replace("gpu", ""))
+                except Exception:
+                    gnum = None
+            if gnum is None:
+                continue
+
+            desc = f"to.{server}:{server_iface}"
+            server_gpu[server][gnum].append((leaf, iface, desc))
+            server_gpus[server].add(gnum)
+
+    for s in list(server_gpus.keys()):
+        server_gpus[s] = sorted(server_gpus[s])
+
+    return server_gpu, server_gpus, leaf_router_id
+
+
+def load_ipv6_base():
+    with open(RESOURCES_FILE) as f:
+        content = f.read()
+    m = re.search(r"IPv6\s*range:\s*([0-9A-Fa-f:]+\/\d+)", content)
+    if not m:
+        raise ValueError("IPv6 base range not found in resources.txt (expected 'IPv6 range: FC00:200::/48').")
+    return ipaddress.ip_network(m.group(1))
+
+
+def next_tenant_index(existing):
+    return len(existing) + 1
+
+
+def _extract_rd_numbers_from_existing(tenants):
+    max_num = 2000
+    for t in tenants:
+        rdmap = t.get("ROUTE_DISTINGUISHER_MAP", {})
+        if isinstance(rdmap, dict):
+            for v in rdmap.values():
+                if isinstance(v, str) and ":" in v:
+                    try:
+                        num = int(v.split(":")[1])
+                        max_num = max(max_num, num)
+                    except Exception:
+                        pass
+    return max_num
+
+
+def print_available_servers(servers, server_gpus):
+    print("\nAvailable servers:")
+    for i, s in enumerate(servers, 1):
+        print(f"{i}) {s}: GPUs {server_gpus[s]}")
+
+
+def main():
+    server_gpu, server_gpus, leaf_router_id = load_fabric_map()
+    base_prefix = load_ipv6_base()
+
+    tenants = []
+    vni_counter, rd_counter, vrf_counter = 20001, 2001, 20001
+    if os.path.exists(YAML_OUT):
+        with open(YAML_OUT) as f:
+            existing = yaml.safe_load(f) or {}
+            tenants = existing.get("tenants", [])
+            if tenants:
+                try:
+                    vni_counter = max(int(t.get("VNI", 20000)) for t in tenants) + 1
+                except ValueError:
+                    vni_counter = 20001
+                rd_counter = _extract_rd_numbers_from_existing(tenants) + 1
+                max_vrf_left = 20000
+                for t in tenants:
+                    vt = t.get("VRF_TARGET")
+                    if isinstance(vt, str) and ":" in vt:
+                        try:
+                            left = int(vt.split(":")[0])
+                            max_vrf_left = max(max_vrf_left, left)
+                        except Exception:
+                            pass
+                vrf_counter = max_vrf_left + 1
+
+    idx = next_tenant_index(tenants)
+    print(f"\n--- Tenant {idx} ---")
+    tenant_name = input(f"Tenant name (default Tenant-{idx}): ").strip() or f"Tenant-{idx}"
+
+    base_int = int(base_prefix.network_address)
+    tenant_net = ipaddress.ip_network((base_int + (idx << (128 - 56)), 56))
+    prefix_56 = str(tenant_net)
+
+    interfaces = []
+    used_servers = set()
+    servers = sorted(
+        server_gpus.keys(),
+        key=lambda s: (not s.upper().startswith("H100"), not s.upper().startswith("MI300"), s.lower())
+    )
+
+    def compute_prefix64(tenant_net, offset_index):
+        base_addr_int = int(tenant_net.network_address)
+        subnet_addr_int = base_addr_int + (offset_index << 64)
+        subnet_addr = ipaddress.IPv6Address(subnet_addr_int)
+        return ipaddress.IPv6Network(f"{subnet_addr}/64", strict=False)
+
+    while True:
+        print_available_servers(servers, server_gpus)
+        choice = input("Select server (blank to finish): ").strip()
+        if choice == "":
+            if not interfaces:
+                print("⚠️ You must add at least one GPU.")
+                continue
+            break
+
+        if not choice.isdigit() or not (1 <= int(choice) <= len(servers)):
+            print("❌ Invalid selection.")
+            continue
+
+        srv = servers[int(choice) - 1]
+        gset = server_gpus[srv]
+        gpu_str = input(f"Enter GPU number for {srv}: ").strip()
+        if not gpu_str.isdigit() or int(gpu_str) not in gset:
+            print("❌ Invalid GPU number.")
+            continue
+        gnum = int(gpu_str)
+
+        mapping_list = server_gpu[srv][gnum]
+        for (leaf, iface, desc) in mapping_list:
+            offset = len(interfaces)
+            p64 = compute_prefix64(tenant_net, offset)
+            rid = leaf_router_id.get(leaf, "0.0.0.0")
+            rd_for_leaf = f"{rid}:{rd_counter}"
+
+            # NOTE: interface keys in lower-case to match the Jinja template
+            interfaces.append({
+                "leaf": leaf,
+                "iface": iface,
+                "description": desc,
+                "ipv6_prefix_64": str(p64)
+            })
+
+            print(f"✅ Added {iface} ({desc}) with prefix {p64} and RD {rd_for_leaf}")
+
+        used_servers.add(srv)
+
+    # Per-leaf RD map only (authoritative)
+    leafs = sorted({i["leaf"] for i in interfaces})
+    rd_map = {}
+    for lf in leafs:
+        rid = leaf_router_id.get(lf, "0.0.0.0")
+        rd_map[lf] = f"{rid}:{rd_counter}"
+
+    tenant = {
+        "TENANT_NAME": tenant_name,
+        "POLICY_NAME": f"BGP-AOS-Policy-{tenant_name}",
+        "COMMUNITY_NAME": f"{tenant_name.upper()}_COMMUNITY_V6",
+        "COMMUNITY_MEMBER_UNIQUE": f"210{idx:02}:26000",
+        "VNI": str(vni_counter),
+        "INTERFACES": interfaces,
+        "ROUTE_DISTINGUISHER_MAP": rd_map,   # <-- only per-leaf map
+        "VRF_TARGET": f"{vrf_counter}:1",
+        "LEAF_NODES": leafs,
+        "PREFIX_56": prefix_56
+    }
+
+    tenants.append(tenant)
+    with open(YAML_OUT, "w") as f:
+        yaml.dump({"tenants": tenants}, f, sort_keys=False)
+
+    rows = []
+    for i in interfaces:
+        leaf = i["leaf"]
+        rd_for_leaf = rd_map.get(leaf, "")
+        rows.append([
+            tenant_name,
+            leaf,
+            tenant["POLICY_NAME"],
+            tenant["COMMUNITY_NAME"],
+            tenant["VNI"],
+            rd_for_leaf,
+            tenant["VRF_TARGET"],
+            prefix_56,
+            f'{i["iface"]} ({i["description"]} {i["ipv6_prefix_64"]})'
+        ])
+
+    print("\n📋 Tenant summary:")
+    print(tabulate(
+        rows,
+        headers=["Tenant","Leaf","Policy","Community","VNI","RD (per leaf)","VRF Target","RIO Prefix (/56)","Interfaces (/64)"]
+    ))
+    print(f"\n💾 Tenant '{tenant_name}' saved to {YAML_OUT} (Servers={len(used_servers)}, Prefix={prefix_56})")
+
+
+if __name__ == "__main__":
+    main()
+Description
+Interactive tenant creation tool designed to automate the definition of new tenants in an AI data center EVPN-VXLAN fabric.
+It generates structured entries in a YAML file (tenants_dynamic.yaml) that describe the logical and addressing properties of each tenant, based on the physical connectivity between leaf switches and GPU servers.
+This script eliminates manual YAML editing by programmatically assigning IPv6 prefixes, VNIs, VRFs, and per-leaf route distinguishers, ensuring consistency and avoiding address or ID overlap across the fabric.
+Functionality Overview
+When executed, the script follows these steps:
+Step 1: Loads Infrastructure Data
+Reads fabric-map.txt to understand how GPU servers and GPU servers NICs connect to leaf switches.
+Each line maps:
+<LEAF> <ROUTER_ID> <IFACE> <SERVER> <SERVER_IFACE>
+
+Example:
+ylara@headend-svr-1:~/TENANTS$ cat fabric-map.txt 
+STRIPE1_LEAF1 10.0.1.0 et-0/0/12:0 H100-01 gpu0_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/12:1 H100-01 gpu1_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/13:0 H100-01 gpu2_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/13:1 H100-01 gpu3_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/16:0 H100-02 gpu0_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/16:1 H100-02 gpu1_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/17:0 H100-02 gpu2_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/17:1 H100-02 gpu3_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/12:0 H100-01 gpu4_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/12:1 H100-01 gpu5_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/13:0 H100-01 gpu6_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/13:1 H100-01 gpu7_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/16:0 H100-02 gpu4_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/16:1 H100-02 gpu5_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/17:0 H100-02 gpu6_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/17:1 H100-02 gpu7_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/12:0 H100-03 gpu0_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/12:1 H100-03 gpu1_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/13:0 H100-03 gpu2_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/13:1 H100-03 gpu3_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/16:0 H100-04 gpu0_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/16:1 H100-04 gpu1_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/17:0 H100-04 gpu2_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/17:1 H100-04 gpu3_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/12:0 H100-03 gpu4_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/12:1 H100-03 gpu5_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/13:0 H100-03 gpu6_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/13:1 H100-03 gpu7_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/16:0 H100-04 gpu4_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/16:1 H100-04 gpu5_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/17:0 H100-04 gpu6_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/17:1 H100-04 gpu7_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/14:0 mi300-01 gpu7_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/14:1 mi300-01 gpu6_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/15:0 mi300-01 gpu4_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/15:1 mi300-01 gpu5_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/14:0 mi300-01 gpu3_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/14:1 mi300-01 gpu2_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/15:0 mi300-01 gpu0_eth
+STRIPE1_LEAF2 10.0.1.1 et-0/0/15:1 mi300-01 gpu1_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/14:0 mi300-02 gpu7_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/14:1 mi300-02 gpu6_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/15:0 mi300-02 gpu4_eth
+STRIPE2_LEAF1 10.0.1.2 et-0/0/15:1 mi300-02 gpu5_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/14:0 mi300-02 gpu3_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/14:1 mi300-02 gpu2_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/15:0 mi300-02 gpu0_eth
+STRIPE2_LEAF2 10.0.1.3 et-0/0/15:1 mi300-02 gpu1_eth
+This fabric map can be created manually, or another script can be created to figure it out.
+Step 2: Loads IPv6 Base Range
+Reads resources.txt to extract the global IPv6 allocation. This defines the base pool from which per-tenant prefixes will be allocated.
+
+Example:
+ylara@headend-svr-1:~/TENANTS$ cat resources.txt 
+IPv6 range: FC00:200::/48
+Step 3: Loads And Continues Existing Counters
+Reads tenants_dynamic.yaml if it exists, retrieving the existing values of
+- Tenants names
+- VNI
+- VRF Target value
+- Assigned IPv6_PREFIX_64
+- etc.
+Example:
+- TENANT_NAME: Crusoe
+  POLICY_NAME: BGP-AOS-Policy-Crusoe
+  COMMUNITY_NAME: CRUSOE_COMMUNITY_V6
+  COMMUNITY_MEMBER_UNIQUE: 210012:26000
+  VNI: '27012'
+    INTERFACES:
+  - leaf: STRIPE1_LEAF1
+    iface: et-0/0/12:0
+    description: to.H100-01:gpu0_eth
+    ipv6_prefix_64: fc00:200:0:2200::/64
+  - leaf: STRIPE2_LEAF1
+    iface: et-0/0/12:0
+    description: to.H100-03:gpu0_eth
+    ipv6_prefix_64: fc00:200:0:2201::/64
+  ROUTE_DISTINGUISHER_MAP:
+    STRIPE1_LEAF1: 10.0.1.0:2033
+    STRIPE2_LEAF1: 10.0.1.2:2033
+  VRF_TARGET: '20034:1'
+  LEAF_NODES:
+  - STRIPE1_LEAF1
+  - STRIPE2_LEAF1
+  PREFIX_56: fc00:200:0:2200::/56
+The script will make sure there are no duplications of the route-target, route-distinguisher, IPv6 prefix, etc.
+Step 4: Interacts With User To Proceed To Tenant Creation
+4.1) Prompts for a tenant name. Suggest a default value with format: Tenant-<index> where index is found from tenants_dynamic.yaml. If the last Tenant-<index> was Tenant-10, it will suggest Tenant-11.
+
+4.2) Displays a numbered list of GPU servers and prompts for:
+- Server selection
+- GPU index (e.g., 0–7)
+Example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ sudo python3 create_dynamic_yaml-with-gpu-server.py
+--- Tenant 25 ---
+Tenant name (default Tenant-25): CRUSOE
+Policy name (default BGP-AOS-Policy-CRUSOE): 
+Community name (default CRUSOE_COMMUNITY_V6): 
+Community member unique (default 21025:26000): 
+VNI (default 20025): 
+Route Distinguisher (default 10.0.1.1:2025): 
+VRF Target (default 20025:1): 
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+Select server (blank to finish): 1
+Enter GPU number for h100-01: 0
+✅ Added et-0/0/12:0 (to.h100-01:gpu0_eth) with prefix fc00:200:0:1800::/64
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+Select server (blank to finish): 3
+Enter GPU number for h100-03: 0
+✅ Added et-0/0/12:0 (to.h100-03:gpu0_eth) with prefix fc00:200:0:1801::/64
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+Select server (blank to finish): <ENTER>
+Step 5: Assigns Identifiers And Addressing
+5.1) Automatically derives the connected leaf and leaf interface(s) and assigns unique /64 prefixes.
+
+5.2) Calculates a unique /56 prefix for the tenant by offsetting within the /48 base.
+
+5.3) Generates per-tenant VNI, VRF Target, and Community Name
+
+5.4) Builds per-leaf route distinguishers (RDs) using:  <leaf-router-id>:<rd_counter>
+
+5.5) Stores all leaf-RD mappings under ROUTE_DISTINGUISHER_MAP
+Step 6: Generates YAML Output
+6.1) Appends the new tenant entry to tenants_dynamic.yaml in this structure:
+
+Example:
+tenants:
+  - TENANT_NAME:<tenant-name>  
+    POLICY_NAME:<tenant-policy-name>  
+    COMMUNITY_NAME:<tenant-community-name>  
+    COMMUNITY_MEMBER_UNIQUE:<tenant-community-value>  
+    VNI:<vni>  
+    ROUTE_DISTINGUISHER_MAP:
+     <node1_name>:<node-1_router-id>:<index>  
+     <node2_name>:<node-2_router-id>:<index>
+    VRF_TARGET:<vrf-target>  
+    LEAF_NODES:
+      - <node1_name>
+      - <node2_name>
+    PREFIX_56:<assigned_per_tenant_/56_prefix> 
+    INTERFACES:
+      - LEAF:<node1_name>
+        IFACE:<node1_interface1_name>
+        DESCRIPTION:<description>
+        IPV6_PREFIX_64:<assigned_per_interface_/64_prefix>
+      - LEAF:<node2_name>
+        IFACE:<node2_interface1_name>
+        DESCRIPTION:<description>
+        IPV6_PREFIX_64:<assigned_per_interface_/64_prefix>
+Step 7: Displays Summary Table
+At completion, prints a formatted table summarizing:
+- Tenant name
+- Leaf node
+- Policy and Community
+- VNI
+- Per-leaf RD
+- VRF Target
+- Tenant /56 and Interface /64 prefixes
+Example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ sudo python3 create_dynamic_yaml-with-gpu-server.py
+
+--- Tenant 25 ---
+Tenant name (default Tenant-25): CRUSOE
+Policy name (default BGP-AOS-Policy-CRUSOE): 
+Community name (default CRUSOE_COMMUNITY_V6): 
+Community member unique (default 21025:26000): 
+VNI (default 20025): 
+VRF Target (default 20035:1): 
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+7) mi300-03: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+8) mi300-04: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+Select server (blank to finish): 1
+Enter GPU number for h100-01: 0
+✅ Added et-0/0/12:0 (to.h100-01:gpu0_eth) with prefix fc00:200:0:1800::/64
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+7) mi300-03: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+8) mi300-04: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+Select server (blank to finish): 3
+Enter GPU number for h100-03: 0
+✅ Added et-0/0/12:0 (to.h100-03:gpu0_eth) with prefix fc00:200:0:1801::/64
+
+Available servers:
+1) h100-01: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+2) h100-02: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+3) h100-03: GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+4) h100-04: GPUs [0, 1, 2, 3, 5, 4, 6, 7]
+5) mi300-01: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+6) mi300-02: GPUs [7, 6, 4, 5, 3, 2, 0, 1]
+7) mi300-03: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+8) mi300-04: GPUs [4, 5, 6, 7, 3, 2, 0, 1]
+Select server (blank to finish): 
+
+📋 Tenant summary:
+Tenant	Leaf	Policy	Community 	VNI	RD	VRF	RIO Prefix (/56)	Interfaces (/64)
+						Target
+----------------------------------------------------------------------------------------------------------------------------------
+CRUSOE	STRIPE1_LEAF1	BGP-AOS-Policy-CRUSOE	CRUSOE_COMMUNITY_V6	20025	10.0.1.1:2025	20025:1	fc00:200:0:1800::/56	et-0/0/12:0 (to.h100-01:gpu0_eth fc00:200:0:1800::/64)
+CRUSOE	STRIPE2_LEAF1	BGP-AOS-Policy-CRUSOE	CRUSOE_COMMUNITY_V6	20025	10.0.1.1:2025	20025:1	fc00:200:0:1800::/56	et-0/0/12:0 (to.h100-03:gpu0_eth fc00:200:0:1801::/64)
+Generated YAML example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ cat tenants_dynamic.yaml
+- TENANT_NAME: CRUSOE
+  POLICY_NAME: BGP-AOS-Policy-CRUSOE
+  COMMUNITY_NAME: CRUSOE_COMMUNITY_V6
+  COMMUNITY_MEMBER_UNIQUE: 21035:26000
+  VNI: '20035'
+  INTERFACES:
+  - leaf: STRIPE1_LEAF1
+    iface: et-0/0/12:0
+    description: to.H100-01:gpu0_eth
+    ipv6_prefix_64: fc00:200:0:2300::/64
+  - leaf: STRIPE2_LEAF1
+    iface: et-0/0/12:0
+    description: to.H100-03:gpu0_eth
+    ipv6_prefix_64: fc00:200:0:2301::/64
+  ROUTE_DISTINGUISHER_MAP:
+    STRIPE1_LEAF1: 10.0.1.0:2034
+    STRIPE2_LEAF1: 10.0.1.2:2034
+  VRF_TARGET: '20035:1'
+  LEAF_NODES:
+  - STRIPE1_LEAF1
+  - STRIPE2_LEAF1
+  PREFIX_56: fc00:200:0:2300::/56  
+Inputs
+The source lists the following inputs and illustrative values:
+Input	Description	Example
+fabric-map.txt	Defines mapping between leafs, router IDs, leaf interfaces, GPU servers and corresponding NICs.	STRIPE1_LEAF1 10.0.1.0 et-0/0/12:0 H100-01 gpu0_eth
+resources.txt	Specifies the global IPv6 base prefix from which all /56 and /64 prefixes are derived.	IPv6 range: FC00:200::/48
+tenants_dynamic.yaml (if existing)	Existing tenant definitions for counter continuation; generated by previous runs.	YAML example below
+User input	New tenant name.	Console example below
+User input	Server(s) to be assigned to tenant.	Console example below
+User input	GPU(s) to be assigned to tenant.	Console example below
+
+
+Additional fabric-map.txt entries:
+fabric-map.txt	Defines mapping between: Leafs, leaf’s router IDs, leaf’s interface(s) connected to GPU servers, GPU server(s) connected to leafs and corresponding NICs.  	STRIPE1_LEAF1 10.0.1.0 et-0/0/12:0 H100-01 gpu0_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/12:1 H100-01 gpu1_eth
+STRIPE1_LEAF1 10.0.1.0 et-0/0/13:0 H100-01 gpu2_eth
+Existing tenant YAML example from the inputs table:
+(if existing)	Existing tenant definitions for counter continuation. YAML file generated by previous runs	- TENANT_NAME: Crusoe
+  POLICY_NAME: BGP-AOS-Policy-Crusoe
+  COMMUNITY_NAME: CRUSOE_COMMUNITY_V6
+  COMMUNITY_MEMBER_UNIQUE: 210012:26000
+  VNI: '27012'
+  INTERFACES:
+  - LEAF: STRIPE1_LEAF1
+    IFACE: et-0/0/12:0
+    DESCRIPTION: to.H100-01:gpu0_eth
+    IPV6_PREFIX_64: fc00:200:0:c00::/128
+  - LEAF: STRIPE2_LEAF1
+    IFACE: et-0/0/12:0
+    DESCRIPTION: to.H100-03:gpu0_eth
+    IPV6_PREFIX_64: fc00:200:0:c01::/128
+  ROUTE_DISTINGUISHER: 10.0.1.0:2712
+  ROUTE_DISTINGUISHER_MAP:
+    STRIPE1_LEAF1: 10.0.1.0:2712
+    STRIPE2_LEAF1: 10.0.1.2:2712
+  VRF_TARGET: '27012:1'
+  LEAF_NODES:
+  - STRIPE1_LEAF1
+  - STRIPE2_LEAF1
+  PREFIX_56: fc00:200:0:c00::/56
+User interaction example from the inputs table:
+User input	New Tenant’s name	ylara@headend-svr-1:~/TENANTS$ python3 create_dynamic_yaml-with-gpu-server.py 
+
+--- Tenant 12 ---
+Tenant name (default Tenant-12): Crusoe
+1) H100-01
+2) H100-02
+3) H100-03
+4) H100-04
+Select server (blank to finish): 1
+Available GPUs for H100-01: [0, 1, 2, 3, 4, 5, 6, 7]
+Enter GPU number for H100-01: 0
+Select server (blank to finish): 3
+Available GPUs for H100-03: [0, 1, 2, 3, 4, 5, 6, 7]
+Enter GPU number for H100-03: 0
+Select server (blank to finish):
+Outputs
+Output file	Description
+tenants_dynamic.yaml	YAML structure with all tenant attributes and interface mappings
+
+
+Key Features
+- ✅ Per-leaf RD assignment based on router IDs from fabric-map.txt
+- ✅ Automatic VNI/VRF allocation (no overlap between tenants)
+- ✅ Hierarchical IPv6 prefixing: /48 → /56 → /64
+- ✅ Backwards compatibility via ROUTE_DISTINGUISHER legacy field
+- ✅ Human-readable summary output via tabulate
+- ✅ Extensible YAML schema for downstream config generation
+Dependencies
+Step 1: Packages Required
+- Python ≥ 3.8
+- Modules: yaml, ipaddress, tabulate, collections, re, os
+Step 2: Input Dependencies
+- fabric-map.txt
+- resources.txt
+Junos Configuration Rendering: generate_dynamic_tenants.py
+Python Script
+#!/usr/bin/env python3
+import yaml
+from jinja2 import Environment, FileSystemLoader
+from collections import defaultdict
+
+YAML_FILE = "tenants_dynamic.yaml"
+TEMPLATE_FILE = "tenant-template-no-comments.j2"
+
+def _interfaces_iter(tenant):
+    for i in tenant.get("INTERFACES", []):
+        if isinstance(i, dict):
+            yield i
+
+def _leaves(tenant):
+    seen = set()
+    out = []
+    for i in _interfaces_iter(tenant):
+        lf = i.get("leaf") or i.get("LEAF")
+        if lf and lf not in seen:
+            seen.add(lf)
+            out.append(lf)
+    return out
+
+def _normalize_intfs_for_leaf(tenant, leaf):
+    norm = []
+    for i in _interfaces_iter(tenant):
+        lf = i.get("leaf") or i.get("LEAF")
+        if lf == leaf:
+            norm.append({
+                "iface": i.get("iface") or i.get("IFACE"),
+                "description": i.get("description") or i.get("DESCRIPTION"),
+                "ipv6_prefix_64": i.get("ipv6_prefix_64") or i.get("IPV6_PREFIX_64"),
+                "leaf": lf,
+            })
+    return norm
+
+def main():
+    with open(YAML_FILE) as f:
+        data = yaml.safe_load(f) or {}
+    tenants = data.get("tenants", [])
+    if not tenants:
+        print("⚠️ No tenants found in tenants_dynamic.yaml")
+        return
+
+    env = Environment(loader=FileSystemLoader("."), trim_blocks=True, lstrip_blocks=True)
+    template = env.get_template(TEMPLATE_FILE)
+
+    combined_blocks = []
+    leaf_outputs = defaultdict(list)
+
+    for tenant in tenants:
+        rd_map = tenant.get("ROUTE_DISTINGUISHER_MAP", {}) or {}
+        leaves = _leaves(tenant)
+
+        # If no leaves, just render as-is (unlikely in this workflow)
+        if not leaves:
+            combined_blocks.append(template.render(**tenant))
+            continue
+
+        # Render one block per leaf (inject per-leaf RD + filtered interfaces)
+        for leaf in leaves:
+            intfs = _normalize_intfs_for_leaf(tenant, leaf)
+            if not intfs:
+                continue
+            rd = rd_map.get(leaf, "")  # per-leaf RD is authoritative
+            t_ctx = dict(tenant)
+            t_ctx["INTERFACES"] = intfs
+            t_ctx["ROUTE_DISTINGUISHER"] = rd
+            rendered = template.render(**t_ctx)
+            leaf_outputs[leaf].append(rendered)
+            combined_blocks.append(rendered)
+
+    with open("all-tenants-dynamic.conf", "w") as f:
+        f.write("\n".join(b.strip() for b in combined_blocks if b).strip() + "\n")
+    print("📦 Combined config saved as all-tenants-dynamic.conf")
+
+    for leaf, blocks in sorted(leaf_outputs.items()):
+        filename = f"tenants-{leaf}.conf"
+        with open(filename, "w") as f:
+            f.write("\n".join(b.strip() for b in blocks if b).strip() + "\n")
+        print(f"📄 Per-leaf config saved as {filename}")
+
+if __name__ == "__main__":
+    main()
+Jinja2 Template: tenant-template-no-comments.j2
+Shell command shown in the source: cat tenant-template-no-comments.j2.
+set policy-options policy-statement AllPodNetworks-{{ TENANT_NAME }} term AllPodNetworks-{{ TENANT_NAME }}-10 from family inet6
+set policy-options policy-statement AllPodNetworks-{{ TENANT_NAME }} term AllPodNetworks-{{ TENANT_NAME }}-10 from protocol direct
+set policy-options policy-statement AllPodNetworks-{{ TENANT_NAME }} term AllPodNetworks-{{ TENANT_NAME }}-10 then community add {{ COMMUNITY_NAME }}
+set policy-options policy-statement AllPodNetworks-{{ TENANT_NAME }} term AllPodNetworks-{{ TENANT_NAME }}-10 then accept
+set policy-options policy-statement AllPodNetworks-{{ TENANT_NAME }} term AllPodNetworks-{{ TENANT_NAME }}-100 then reject
+
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-10 from policy AllPodNetworks-{{ TENANT_NAME }}
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-10 then accept
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-20 from protocol evpn
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-20 from route-filter 0::0/0 prefix-length-range /128-/128
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-20 then community add {{ COMMUNITY_NAME }}
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-20 then accept
+set policy-options policy-statement BGP-AOS-Policy-{{ TENANT_NAME }} term BGP-AOS-Policy-{{ TENANT_NAME }}-100 then reject
+
+set policy-options community {{ COMMUNITY_NAME }} members 5:20008
+set policy-options community {{ COMMUNITY_NAME }} members {{ COMMUNITY_MEMBER_UNIQUE }}
+
+set routing-instances {{ TENANT_NAME }} instance-type vrf
+set routing-instances {{ TENANT_NAME }} routing-options rib {{ TENANT_NAME }}.inet6.0 multipath
+set routing-instances {{ TENANT_NAME }} routing-options graceful-restart
+set routing-instances {{ TENANT_NAME }} routing-options multipath
+set routing-instances {{ TENANT_NAME }} protocols evpn ip-prefix-routes advertise direct-nexthop
+set routing-instances {{ TENANT_NAME }} protocols evpn ip-prefix-routes encapsulation vxlan
+set routing-instances {{ TENANT_NAME }} protocols evpn ip-prefix-routes vni {{ VNI }}
+set routing-instances {{ TENANT_NAME }} protocols evpn ip-prefix-routes export BGP-AOS-Policy-{{ TENANT_NAME }}
+
+{% for intf in INTERFACES %}
+set routing-instances {{ TENANT_NAME }} interface {{ intf.iface }}
+set interfaces {{ intf.iface }} description {{ intf.description }}
+set interfaces {{ intf.iface }} mtu 9216
+set interfaces {{ intf.iface }} unit 0 family inet6 address {{ intf.ipv6_prefix_64 | replace('::/64','::1/64') }}
+
+set protocols router-advertisement interface {{ intf.iface }}.0 prefix {{ intf.ipv6_prefix_64 }}
+set protocols router-advertisement interface {{ intf.iface }}.0 rio-prefix {{ PREFIX_56 }} rio-lifetime 6000000
+{% endfor %}
+
+set routing-instances {{ TENANT_NAME }} route-distinguisher {{ ROUTE_DISTINGUISHER }}
+set routing-instances {{ TENANT_NAME }} vrf-target target:{{ VRF_TARGET }}
+Description
+Tenant configuration rendering engine for Juniper EVPN-VXLAN AI fabrics.
+
+It reads the tenants_dynamic.yaml file created by create_dynamic_yaml-with-gpu-server.py and generates:
+- A single combined configuration (all-tenants-dynamic.conf) with all tenants, and
+- Per-tenant, per-leaf configuration files (e.g., TenantA-STRIPE1_LEAF1.conf, TenantA-STRIPE2_LEAF1.conf) that include only the interfaces present on each leaf.
+  The script uses a Jinja2 template (tenant-template-no-comments.j2) to generate Junos set-style configuration lines per tenant, per interface, and per leaf.
+This approach allows for deterministic, automated configuration generation with proper variable substitution for RDs, VRFs, IPv6 addresses, etc.
+Functionality Overview
+When executed, the script follows these steps:
+Step 1: Cleans Previously Generated Files
+Deletes any pre-existing generated files that match:
+-STRIPE.conf (per-tenant/leaf configs)
+tenants-STRIPE*.conf (older aggregate files, optional)
+This ensures a clean slate before generating new config files.
+Step 2: Load Tenant YAML
+Reads tenants_dynamic.yaml, a yaml containing all the parameters generated per tenant by the create_dynamic_yaml-with-gpu-server.py script
+Step 3: Loads Jinja2 Template
+Reads tenant-template-no-comments.j2, a text-based Jinja2 template used to render tenant configs.
+Variables like {{ TENANT_NAME }}, {{ VNI }}, {{ RD_ROUTER_ID }}, etc. are populated with data from the YAML.
+Step 4: Generates Config Files
+Configuration for each tenant is rendered using the Jinja2 template and the contents of tenants_dynamic.yaml
+
+The resulting config block is written to tenants-{leaf}.conf and appended to the all-tenants-dynamic.conf file.
+
+Example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ sudo python3 generate-dynamic-tenants-multiple-files.py
+📦 Combined config saved as all-tenants-dynamic.conf
+📄 Per-leaf config saved as tenants-STRIPE1_LEAF1.conf
+📄 Per-leaf config saved as tenants-STRIPE2_LEAF1.conf
+Example per-leaf configuration for STRIPE1_LEAF1:
+ylara@headend-svr-1:~/TENANTS$ cat tenants-STRIPE1_LEAF1.conf
+set routing-instances CRUSOE route-distinguisher 10.0.1.1:2025
+set routing-instances CRUSOE vrf-target target:20025:1
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 from family inet6
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 from protocol direct
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 then community add CRUSOE_COMMUNITY_V6
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 then accept
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-100 then reject
+
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-10 from policy AllPodNetworks-Crusoe
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-10 then accept
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 from protocol evpn
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 from route-filter 0::0/0 prefix-length-range /128-/128
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 then community add CRUSOE_COMMUNITY_V6
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 then accept
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-100 then reject
+
+set policy-options community CRUSOE_COMMUNITY_V6 members 5:20008
+set policy-options community CRUSOE_COMMUNITY_V6 members 21026:26000
+
+set routing-instances Crusoe instance-type vrf
+set routing-instances Crusoe routing-options rib Crusoe.inet6.0 multipath
+set routing-instances Crusoe routing-options graceful-restart
+set routing-instances Crusoe routing-options multipath
+set routing-instances Crusoe protocols evpn ip-prefix-routes advertise direct-nexthop
+set routing-instances Crusoe protocols evpn ip-prefix-routes encapsulation vxlan
+set routing-instances Crusoe protocols evpn ip-prefix-routes vni 20026
+set routing-instances Crusoe protocols evpn ip-prefix-routes export BGP-AOS-Policy-Crusoe
+
+set routing-instances Crusoe interface et-0/0/12:0
+set interfaces et-0/0/12:0 description to.h100-01:gpu0_eth
+set interfaces et-0/0/12:0 mtu 9216
+set interfaces et-0/0/12:0 unit 0 family inet6 address fc00:200:0:1900::1/64
+
+set protocols router-advertisement interface et-0/0/12:0.0 prefix fc00:200:0:1900::/64
+set protocols router-advertisement interface et-0/0/12:0.0 rio-prefix fc00:200:0:1900::/56 rio-lifetime 6000000
+
+set routing-instances Crusoe route-distinguisher 
+set routing-instances Crusoe vrf-target target:20026:1
+Example per-leaf configuration for STRIPE2_LEAF1:
+ylara@headend-svr-1:~/TENANTS$ cat Crusoe-STRIPE2_LEAF1.conf
+set routing-instances CRUSOE route-distinguisher 10.0.1.1:2025
+set routing-instances CRUSOE vrf-target target:20025:1
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 from family inet6
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 from protocol direct
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 then community add CRUSOE_COMMUNITY_V6
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-10 then accept
+set policy-options policy-statement AllPodNetworks-Crusoe term AllPodNetworks-Crusoe-100 then reject
+
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-10 from policy AllPodNetworks-Crusoe
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-10 then accept
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 from protocol evpn
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 from route-filter 0::0/0 prefix-length-range /128-/128
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 then community add CRUSOE_COMMUNITY_V6
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-20 then accept
+set policy-options policy-statement BGP-AOS-Policy-Crusoe term BGP-AOS-Policy-Crusoe-100 then reject
+
+set policy-options community CRUSOE_COMMUNITY_V6 members 5:20008
+set policy-options community CRUSOE_COMMUNITY_V6 members 21026:26000
+
+set routing-instances Crusoe instance-type vrf
+set routing-instances Crusoe routing-options rib Crusoe.inet6.0 multipath
+set routing-instances Crusoe routing-options graceful-restart
+set routing-instances Crusoe routing-options multipath
+set routing-instances Crusoe protocols evpn ip-prefix-routes advertise direct-nexthop
+set routing-instances Crusoe protocols evpn ip-prefix-routes encapsulation vxlan
+set routing-instances Crusoe protocols evpn ip-prefix-routes vni 20026
+set routing-instances Crusoe protocols evpn ip-prefix-routes export BGP-AOS-Policy-Crusoe
+
+set routing-instances Crusoe interface et-0/0/12:0
+set interfaces et-0/0/12:0 description to.h100-03:gpu0_eth
+set interfaces et-0/0/12:0 mtu 9216
+set interfaces et-0/0/12:0 unit 0 family inet6 address fc00:200:0:1901::1/64
+
+set protocols router-advertisement interface et-0/0/12:0.0 prefix fc00:200:0:1901::/64
+set protocols router-advertisement interface et-0/0/12:0.0 rio-prefix fc00:200:0:1900::/56 rio-lifetime 6000000
+
+set routing-instances Crusoe route-distinguisher 
+set routing-instances Crusoe vrf-target target:20026:1
+Step 5: Displays Output
+Prints a message for each generated per-leaf config file and confirms successful creation of the combined file.
+
+Example:
+ylara@headend-svr-1:~/TENANTS$ python3 generate_dynamic_tenants.py 
+📄 Per-tenant/leaf config saved as Tenant-6-UNSPECIFIED.conf
+📄 Per-tenant/leaf config saved as Oracle-STRIPE1_LEAF1.conf
+📄 Per-tenant/leaf config saved as Oracle-STRIPE2_LEAF1.conf
+📄 Per-tenant/leaf config saved as Oracle1-STRIPE1_LEAF1.conf
+📄 Per-tenant/leaf config saved as Oracle2-STRIPE1_LEAF1.conf
+📄 Per-tenant/leaf config saved as Crusoe-STRIPE1_LEAF1.conf
+📄 Per-tenant/leaf config saved as Crusoe-STRIPE2_LEAF1.conf
+📦 Combined config saved as all-tenants-dynamic.conf
+✅ All tenant configs generated successfully.
+Inputs
+Input	Description
+tenants_dynamic.yaml	List of tenant entries created by create_dynamic_yaml-with-gpu-server.py.
+tenant-template-no-comments.j2	Jinja2 template to render configuration per tenant.
+
+
+Outputs
+Output file	Description
+all-tenants-dynamic.conf	Junos set commands.
+<tenant>-<LEAF>.conf	Subset of interfaces per leaf, rendered using the template.
+
+
+Key Features
+- ✅ Per-leaf configuration generation
+- ✅ Template-based rendering using Jinja2 for flexibility and portability
+- ✅ Cleans stale files to avoid accidental reuse or config drift
+- ✅ Automatically groups interfaces by leaf for correct scoping
+Dependencies
+Step 1: Packages Required
+- Python ≥ 3.8
+- Python modules:
+- yaml
+- jinja2
+- re
+- glob
+- os
+- collections
+- copy
+Step 2: Input Dependencies
+- tenants_dynamic.yaml generated by create_dynamic_yaml-with-gpu-server.py
+- tenant-template-no-comments.j2 provided by user
+Configuration Deployment: deploy-tenants.sh
+Bash Script
+#!/bin/bash
+set -euo pipefail
+
+LEAF_FILE="leaf-nodes.txt"
+USER="jnpr"
+PASS="pass123"
+TARGET_ALIAS="${1:-}"
+
+[ -f "$LEAF_FILE" ] || { echo "❌ $LEAF_FILE not found"; exit 1; }
+
+# Build target list (alias + IP per line)
+if [ -n "$TARGET_ALIAS" ]; then
+  targets="$(grep -w "$TARGET_ALIAS" "$LEAF_FILE" || true)"
+  [ -n "$targets" ] || { echo "❌ Leaf alias $TARGET_ALIAS not in $LEAF_FILE"; exit 1; }
+else
+  echo "Available leaf nodes:"
+  nl -w1 -s') ' "$LEAF_FILE"
+  read -rp "Select leaf node(s) to deploy to (e.g. 1 3 or 'all'): " choices
+  if [[ "$choices" == "all" ]]; then
+    targets="$(cat "$LEAF_FILE")"
+  else
+    targets=""
+    for c in $choices; do
+      [[ "$c" =~ ^[0-9]+$ ]] || { echo "❌ Invalid choice: $c"; exit 1; }
+      line="$(sed -n "${c}p" "$LEAF_FILE")"
+      [ -n "$line" ] || { echo "❌ Invalid index: $c"; exit 1; }
+      targets+="$line"$'\n'
+    done
+  fi
+fi
+
+overall_rc=0
+
+while IFS=$' \t' read -r alias ip; do
+  [ -n "${alias:-}" ] || continue
+
+  CONF_LOCAL="tenants-${alias}.conf"
+  if [ ! -f "$CONF_LOCAL" ]; then
+    echo "⚠️  Skipping $alias ($ip): $CONF_LOCAL not found."
+    overall_rc=1
+    continue
+  fi
+
+  REMOTE_SET="/var/tmp/${alias}-tenant.set"
+  echo "📤 Copying $CONF_LOCAL → $alias ($ip):$REMOTE_SET"
+  sshpass -p "$PASS" scp -o StrictHostKeyChecking=no "$CONF_LOCAL" "$USER@$ip:$REMOTE_SET"
+
+  echo "🛠️  Configure + commit on $alias ($ip)…"
+  commit_out="$(
+    sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no "$USER@$ip" <<EOF
+set cli screen-length 0
+configure
+load set $REMOTE_SET
+commit
+exit
+EOF
+  )" || true   # don't let SSH nonzero kill the script; we parse output instead
+
+  # Detect Junos commit failure text
+  if echo "$commit_out" | grep -qiE 'error: commit failed|configuration check-out failed|statements constraint check failed'; then
+    echo "❌ $alias ($ip): NOT successful — commit failed."
+    echo "----- commit output begin -----"
+    echo "$commit_out"
+    echo "------ commit output end ------"
+    echo "↩️  Rolling back on $alias ($ip)…"
+    sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no "$USER@$ip" <<'EOF'
+configure
+rollback
+exit
+EOF
+    overall_rc=1
+  else
+    echo "✅ $alias ($ip): committed successfully."
+  fi
+done <<< "$targets"
+
+exit $overall_rc
+Description
+Automates the deployment of the dynamically generated tenant configuration (all-tenants-dynamic.conf) to one or more Juniper leaf switches.
+
+It reads the list of available leaf nodes from leaf-nodes.txt, presents an interactive selection menu, and pushes the configuration via SSH using non-interactive credentials.
+
+This script ensures consistent, repeatable, and error-free configuration delivery across multiple devices in the EVPN-VXLAN AI fabric.
+Functionality Overview
+Step 1: Validate Input Files
+1.1) Checks for the existence of:
+- leaf-nodes.txt (list of available leaf nodes)
+- all-tenants-dynamic.conf (configuration file generated by generate_dynamic_tenants.py)
+  1.2) If either file is missing, the script exits with an error message.
+Step 2: Display Leaf Node Menu
+2.1) Reads each line from leaf-nodes.txt in the format:
+- <LEAF_ALIAS> <LEAF_IP>
+  2.2) Displays all entries as a numbered list for user selection.
+Step 3: Prompt For User Selection
+Prompts the user to select one or more leaf nodes by number (e.g., 1, or 1 3) or all at once (all).
+Step 4: Build Target List
+4.1) If all is chosen, every leaf listed in the file becomes a deployment target.
+
+4.2) If numeric choices are provided, the script matches them with corresponding lines from leaf-nodes.txt.
+Step 5: Deploy Configuration
+Iterates over the selected leaf targets from leaf-nodes.txt (via menu or a single alias argument). For each target <ALIAS> <IP>:
+5.1) Selects per-leaf config file: tenants-<ALIAS>.conf.
+
+5.2) Copies the file to the switch (SCP) as /var/tmp/<ALIAS>-tenant.set using sshpass with USER and PASS defined in the script.
+
+5.3) Opens one CLI session and runs:
+configure
+load set /var/tmp/<ALIAS>-tenant.set
+commit
+exit
+5.4) Parses the commit output locally:
+- If commit fails (detects error: commit failed / constraint errors):
+  → a quick follow-up session runs:
+configure
+rollback
+exit
+Reports NOT successful for that device.
+
+Example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ ./deploy-tenants.sh 
+Available leaf nodes:
+1) STRIPE1_LEAF1 10.161.32.96
+2) STRIPE1_LEAF2 10.161.32.97
+3) STRIPE2_LEAF1 10.161.33.38
+4) STRIPE2_LEAF2 10.161.33.39
+Select leaf node(s) to deploy to (e.g. 1 3 or 'all'): 3
+📤 Copying tenants-STRIPE2_LEAF1.conf → STRIPE2_LEAF1 (10.161.33.38):/var/tmp/STRIPE2_LEAF1-tenant.set
+Welcome to the Sunnyvale POC Lab
+🛠️  Configure + commit on STRIPE2_LEAF1 (10.161.33.38)…
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+Welcome to the Sunnyvale POC Lab
+❌ STRIPE2_LEAF1 (10.161.33.38): NOT successful — commit failed.
+----- commit output begin -----
+jnpr@stripe2-leaf1> set cli screen-length 0 
+Screen length set to 0
+
+jnpr@stripe2-leaf1> configure 
+Entering configuration mode
+Users currently editing the configuration:
+  jnpr terminal pts/0 (pid 14817) on since 2025-11-05 13:31:34 PST
+      [edit]
+
+[edit]
+jnpr@stripe2-leaf1# load set /var/tmp/STRIPE2_LEAF1-tenant.set 
+load complete
+
+[edit]
+jnpr@stripe2-leaf1# commit 
+[edit interfaces et-0/0/16:1 unit 0 family]
+  'ethernet-switching'
+    Family ethernet-switching and rest of the families are mutually exclusive
+[edit routing-instances YASMIN interface]
+  'et-0/0/16:1.0'
+    Interface with 'interface-mode' is allowed only in a virtual-switch or mac-vrf instance
+error: commit failed: (statements constraint check failed)
+
+[edit]
+jnpr@stripe2-leaf1# exit 
+The configuration has been changed but not committed
+Exit with uncommitted changes? [yes,no] (yes) 
+
+Exiting configuration mode
+------ commit output end ------
+↩️  Rolling back on STRIPE2_LEAF1 (10.161.33.38)…
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+Welcome to the Sunnyvale POC Lab
+jnpr@stripe2-leaf1> configure 
+Entering configuration mode
+Users currently editing the configuration:
+  jnpr terminal pts/0 (pid 14817) on since 2025-11-05 13:31:34 PST
+      [edit]
+The configuration has been changed but not committed
+
+[edit]
+jnpr@stripe2-leaf1# rollback 
+load complete
+
+[edit]
+jnpr@stripe2-leaf1# exit 
+Exiting configuration mode
+
+jnpr@stripe2-leaf1>
+- If commit succeeds:
+  Reports successful for that device.
+Example:
+ylara@headend-svr-1:~/TENANTS/DRAFTS/new-workflow$ ./deploy-tenants.sh 
+Available leaf nodes:
+1) STRIPE1_LEAF1 10.161.32.96
+2) STRIPE1_LEAF2 10.161.32.97
+3) STRIPE2_LEAF1 10.161.33.38
+4) STRIPE2_LEAF2 10.161.33.39
+Select leaf node(s) to deploy to (e.g. 1 3 or 'all'): 3
+📤 Copying tenants-STRIPE2_LEAF1.conf → STRIPE2_LEAF1 (10.161.33.38):/var/tmp/STRIPE2_LEAF1-tenant.set
+Welcome to the Sunnyvale POC Lab
+🛠️  Configure + commit on STRIPE2_LEAF1 (10.161.33.38)…
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+Welcome to the Sunnyvale POC Lab
+✅ STRIPE2_LEAF1 (10.161.33.38): committed successfully.
+Inputs
+Input	Description	Example
+leaf-nodes.txt	Defines all available leaf switches and their IP addresses for SSH access. Each line has <ALIAS> <IP>.	STRIPE1_LEAF1 10.161.32.96
+all-tenants-dynamic.conf	Combined configuration generated by generate_dynamic_tenants.py containing all tenant set commands.	set routing-instances Tenant-Crusoe ...
+USER	Username for SSH login.	jnpr
+PASS	Password for SSH login.	pass123
+
+
+Outputs
+Output	Description	Example
+Console message	Real-time feedback on deployment status for each leaf. Indicates commit success, failure, or rollback.	✅ Configuration successfully deployed to STRIPE1_LEAF1 (10.161.32.96)
+Device Config	The configuration is applied directly on each Junos device. No output file is created locally.	set policy-options community CRUSOE_COMMUNITY_V6 members 210012:26000
+
+
+Key Features
+- ✅ Interactive Menu – User-friendly selection of target devices.
+- 🔒 Non-Interactive Authentication – Uses sshpass for password automation (no prompt).
+- ⚙️ Automated Config Deployment – Pushes complete configuration in one step.
+- 🔄 Rollback Safety – If commit fails, automatic rollback ensures configuration consistency.
+- 📦 Multi-Device Support – Supports single or multiple simultaneous target selections.
+- 🧩 Integrates Seamlessly – Works directly with the output of generate_dynamic_tenants.py.
+Dependencies
+Step 1: System Requirements
+- Linux or macOS environment with Bash 4+
+- Network connectivity to all listed leaf nodes
+Step 2: Packages Required
+- sshpass (for automated SSH password handling)
+- sudo apt install sshpass
+Step 3: Input Dependencies
+- leaf-nodes.txt file created manually or via automation.
+- tenants-<ALIAS>.conf generated by generate_dynamic_tenants.py.
